@@ -1,0 +1,321 @@
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <noise.glsl>
+
+struct Material {
+	Color3		color;
+};
+
+struct Surfel {
+    Point3      position;
+    Vector3     normal;
+    Material    material;
+};
+
+struct Plane {
+	Point3		center;
+	Vector3		normal;
+    Material    material;
+};
+
+struct Sphere {
+    Point3      center;
+    float       radius;
+    Material    material;
+};
+
+struct Box {
+    Point3      center;
+    Vector3     b;				// Vector from center to first-quadrant corner
+    Material    material;
+};
+
+struct RoundedBox {
+    Point3      center;
+    Vector3     b;				// Vector from center to first-quadrant corner
+	float		radius;
+    Material    material;
+};
+
+struct Cylinder {
+	Point3		center;
+	float		radius;
+	float		halfHeight;
+	Material	material;
+};
+
+struct Torus {
+	Point3		center;
+	float		R;				// Major radius
+	float		r;				// Minor radius
+    Material    material;
+};
+
+
+// Input arguments from App
+uniform mat4x3         cameraToWorldMatrix;
+uniform TextureCube    environmentMap;
+uniform float          tanHalfFieldOfViewY;
+uniform float          projectionMatrix22, projectionMatrix23;
+
+// Output to App::m_framebuffer
+out Color3 pixelColor;
+
+const Radiance3 ambientLight = Radiance3(0.5);
+const Material groundMaterial = Material(Color3(0.2));
+
+
+// Signed distance functions for primitives, taken from GraphicsCodex
+float estimateDistance(Point3 X, Sphere sphere) {
+    return length(X - sphere.center) - sphere.radius;
+}
+
+float estimateDistance(Point3 X, Plane plane) {
+    return dot(X - plane.center, plane.normal);
+}
+
+float estimateDistance(Point3 X, Box box) {
+    Vector3 d = abs(X - box.center) - box.b;
+    return min(maxComponent(d), 0.0) + length(max(d, Vector3(0.0, 0.0, 0.0)));
+}
+
+float estimateDistance(Point3 X, RoundedBox box) {
+	return length(max(abs(X - box.center) - box.b, Vector3(0.0, 0.0, 0.0))) - box.radius;
+}
+
+float estimateDistance(Point3 X, Cylinder cyl) {
+	Point3 C = cyl.center;
+    Vector2 d = abs(Vector2(length(X.xz - C.xz), X.y - C.y)) - Vector2(cyl.radius, cyl.halfHeight);
+    return min(maxComponent(d), 0.0) + length(max(d, Vector2(0.0, 0.0)));
+}
+
+float estimateDistance(Point3 X, Torus torus) {
+	Point3 C = torus.center;
+    return length(vec2(length(X.xz - C.xz) - torus.R, X.y - C.y)) - torus.r;
+}
+
+// Analytic intersection with sphere
+float analyticIntersect(Point3 X, Vector3 w, Sphere sphere, inout Surfel surfel) {
+     Point3  C = sphere.center;
+     float   r = sphere.radius;
+     
+     Vector3 v = X - C;
+
+	 // Plugging ray parameterization into implicit equation of sphere gives quadratic equation in t
+	 // Solve for the roots
+     float b = 2.0 * dot(w, v);
+     float c = dot(v, v) - square(r);
+     float determinant = square(b) - 4.0 * c;
+	 // If determinant is negative, roots are imaginary, so there is no intersection
+	 if ( determinant < 0 ) {
+		 return inf;
+	 }
+          
+     // Plug into quadratic equation and choose first positive intersection
+     float dsqrt = sqrt(determinant);
+	 float t = min(infIfNegative((-b - dsqrt) / 2.0),   
+                   infIfNegative((-b + dsqrt) / 2.0));
+	 
+	 surfel.position = X + w * t;
+	 surfel.normal   = normalize(surfel.position - C);
+	 surfel.material = sphere.material;
+     return t;
+}
+    
+
+// Operators on distance estimators, taken from GraphicsCodex
+// Given two distances to surfaces, takes the union of them and returns the material
+// of the closer surface.
+float surfaceUnion(float h, float f, inout Material hMat, Material fMat) {
+	float result = min(h, f);
+	if (result == f) {
+		hMat = fMat;
+	}
+	return result;
+}
+
+// Given two distances to surfaces, takes the subtraction of them and returns the material
+// of the closer surface.
+float subtractSurface(float h, float f, inout Material hMat, Material fMat) {
+	float result = max(h, -f);
+	if (result == -f) {
+		hMat = fMat;
+	}
+	return result;
+}
+
+#define intersectSurface(h, f) max(h, f)
+
+#define repeat(X, period) mod(X, period)
+
+#define transformSurface(h, M, X)\
+  h((inverse(M) * vec4(X, 1.0)).xyz) * determinant(M)
+    
+
+// Signed distane function for all the surfaces in the scene.
+// Calls estimateDistance function for all the surfaces in the scene
+// and return the smallest result.
+// Also returns the material of the closest surface.
+float sceneDistance(Point3 X, inout Material mat) {
+	Material red = Material(Color3(1.0, 0.0, 0.0));
+	Material green = Material(Color3(0.0, 1.0, 0.0));
+	Material blue = Material(Color3(0.0, 0.0, 1.0));
+	Material black = Material(Color3(0.0));
+
+	Plane surface0 = Plane(Point3(0.0), Vector3(0.0, 1.0, 0.0), groundMaterial);						// Ground
+	RoundedBox surface1 = RoundedBox(Point3(0.0, 3.4, 0.4), Vector3(2.5, 2.0, 2.0), 0.5, red);			// Monitor
+	Box surface2 = Box(Point3(0.0, 3.4, 1.2), Vector3(2.35, 2.0, 1.75), black);							// Screen
+	Cylinder surface3 = Cylinder(Point3(-0.18, 0.6, 0.0), 1.5, 0.4, red);								// Mount
+	Cylinder surface4 = Cylinder(Point3(-0.18, 0.2, 0.0), 2.8, 0.2, red);								// Base
+	RoundedBox surface5 = RoundedBox(Point3(0.1, 0.1, 4.8), Vector3(4.8, 0.0001, 1.5), 0.15, blue);		// Keyboard
+	Sphere surface6 = Sphere(Point3(5.0, 0.5, 1.0), 0.5, green);
+
+	RoundedBox surface7 = RoundedBox(Point3(0.5, 0.25, 3.8), Vector3(0.2, 0.0001, 0.2), 0.05, black);	// Keys
+	RoundedBox surface8 = RoundedBox(Point3(0.5, 0.25, 4.5), Vector3(0.2, 0.0001, 0.2), 0.05, black);
+	RoundedBox surface9 = RoundedBox(Point3(0.5, 0.25, 5.2), Vector3(0.2, 0.0001, 0.2), 0.05, black);
+	RoundedBox surface10 = RoundedBox(Point3(0.5, 0.25, 5.9), Vector3(0.2, 0.0001, 0.2), 0.05, black);
+	Box bound7 = Box(Point3(0.1, 0.3, 3.8), Vector3(4.8, 1.0, 1.5), black);								// Bounding boxes for repetition of keys
+	Box bound8 = Box(Point3(0.1, 0.3, 4.5), Vector3(4.8, 1.0, 1.5), black);
+	Box bound9 = Box(Point3(0.1, 0.3, 5.2), Vector3(4.8, 1.0, 1.5), black);
+	Box bound10 = Box(Point3(0.1, 0.3, 5.9), Vector3(4.8, 1.0, 1.5), black);
+
+	float d = estimateDistance(X, surface0);
+	float d1;
+
+	// Macro generates the lines of the code in the for loop.
+	// Loop to add surfaces to the scene and union them together
+#	for (int i = 1; i < 7; ++i)
+		d1 = estimateDistance(X, surface$(i));
+		d = surfaceUnion(d, d1, surface0.material, surface$(i).material);
+#	endfor
+
+	// Loop to add keys repeatedly, each time unioning them together
+#	for (int i = 7; i < 11; ++i)
+		d1 = intersectSurface( estimateDistance(mod(X, Vector3(0.8, 0.0, 0.0)), surface$(i)),
+							   estimateDistance(X, bound$(i)) );
+		d = surfaceUnion(d, d1, surface0.material, surface$(i).material);
+#	endfor
+
+	mat = surface0.material;
+
+	if (d < d1) {
+		return d;
+	} else {
+		return d1;
+	}
+}
+
+float sceneDistance(Point3 X) {
+	Material ignore;
+	return sceneDistance(X, ignore);
+}
+
+// Calculate the normal at a point by calculating the derivative of sceneDistance at that point
+Vector3 normalAt(Point3 X) {
+    const float eps = 1e-4;
+    float d = sceneDistance(X);
+    return normalize(Vector3(
+		sceneDistance(X + Vector3(eps, 0.0, 0.0)),
+        sceneDistance(X + Vector3(0.0, eps, 0.0)),
+        sceneDistance(X + Vector3(0.0, 0.0, eps))) - Vector3(d, d, d));
+}
+
+
+// Trace ray from camera to scene, return true if hit, false if no hit
+// If hit, return a surfel with location of intersection and material of the surface we hit
+bool traceRay(Point3 origin, Vector3 direction, inout Surfel surf) {
+    const float maxDistance   = 1e10;
+    const int   maxIterations = 200;
+    const float closeEnough   = 1e-4;
+	const float eps			  = 1e-4;
+
+	// How far we go along the ray until we reach an intersection
+    float t = 0;
+
+	Material mat;
+	for (int i = 0; i < maxIterations; ++i) {
+	    float stepDistance = sceneDistance(origin + direction * t, mat);
+		t += stepDistance;
+		
+		// If we've gotten really close to an object, or we've intersected the ground, it's a hit
+		if (stepDistance < closeEnough) {
+			Point3 intersection = origin + direction * t;
+			Vector3 normal = normalAt(intersection);
+			surf.position = intersection;
+			surf.normal = normal;
+			surf.material = mat;
+			return true;
+		}
+	}
+	
+	// Ray didn't intersect the scene, hits the "sky"
+	return false;
+}
+
+
+// Placeholder functions for biradiance and bsdf
+float biradiance(Point3 X) {
+	return 1.5;
+}
+
+float bsdf(Vector3 w_i, Vector3 w_o) {
+	return 1.0 / pi;
+}
+
+Radiance3 shade(Surfel surfel, Vector3 direction) {
+	Radiance3 L_o = surfel.material.color * ambientLight;
+	Point3 X = surfel.position;
+	Vector3 n = surfel.normal;
+	Vector3 w_i = normalize(Vector3(1.0, 1.0, 0.5)); // Direction of the light
+	Vector3 w_o = -direction;
+
+	// Bump the ray
+	Point3 bumped = X + (n * 2e-2);
+
+	// If not in shadow
+	if (!traceRay(bumped, w_i, surfel)) {
+		L_o += surfel.material.color + biradiance(X) * bsdf(w_i, w_o) * dot(w_i, n);
+	}
+
+	return L_o;
+}
+
+
+void main() {
+    // Generate an eye ray in camera space, and then transform to world space
+
+    // Primary ray origin    
+    Point3 P  = cameraToWorldMatrix[3];
+
+    // Primary ray direction
+    Vector3 w = Matrix3(cameraToWorldMatrix) * 
+        normalize(Vector3((gl_FragCoord.xy - g3d_FragCoordExtent / 2.0) * Vector2(1, -1),
+                          g3d_FragCoordExtent.y / ( -2.0 * tanHalfFieldOfViewY)));      
+
+    //////////////////////////////////////
+
+    // Render the scene:
+
+	Surfel surf;
+	bool intersection = traceRay(P, w, surf);
+
+	// If primary ray intersects scene, shade the surfel where it intersects
+	if ( intersection ) {
+		pixelColor = shade(surf, w);
+	}
+	// If primary ray doesn't intersect the scene, return the color of the skybox in the direction of the primary ray
+	else {
+		pixelColor = sampleTexture(environmentMap, w).rgb;
+	}
+
+    //////////////////////////////////////
+     
+	float maxDist = inf;
+
+    // Camera space z value
+    float csZ = inf / w.z;
+    
+    // Pack into standard OpenGL depth buffer format to make the result compatible
+    // with rasterization and post-processing.
+    gl_FragDepth = (maxDist == inf) ? 1.0 : ((projectionMatrix22 * csZ + projectionMatrix23) / -csZ);
+}
